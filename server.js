@@ -68,19 +68,4 @@ app.post('/api/chat', async (req, res) => {
       const status = upstream.status === 401 || upstream.status === 429 ? upstream.status : 502;
       const msg = upstream.status === 401 ? 'AI API key was rejected. Check the server secret.'
         : upstream.status === 429 ? 'AI API quota or rate limit reached. Check your API billing and limits.'
-        : (data?.error?.message || 'AI provider returned an error.');
-      return res.status(status).json({ error: msg });
-    }
-    const reply = (data.output || []).flatMap(item => item.content || [])
-      .filter(part => part.type === 'output_text').map(part => part.text).join('\n').trim();
-    if (!reply) return res.status(502).json({ error: 'The AI returned an empty response. Try again.' });
-    res.json({ reply });
-  } catch (err) {
-    if (err.name === 'AbortError') return res.status(504).json({ error: 'The AI took too long to respond. Please try again.' });
-    console.error('AgentAI chat error:', err.message);
-    res.status(500).json({ error: 'Server error. Check the server logs.' });
-  }
-});
-
-const port = Number(process.env.PORT || 3000);
-app.listen(port, () => console.log(`AgentAI running on port ${port}`));
+        : (data?.error?.message || 'AI provid
