@@ -1,15 +1,24 @@
+
 const express = require('express');
 const path = require('path');
 require('dotenv').config();
 
 const app = express();
 app.disable('x-powered-by');
+
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Frame-Options', 'DENY');
+  next();
+});
+
 app.use(express.json({ limit: '32kb' }));
 
 const hits = new Map();
 
 app.use('/api/', (req, res, next) => {
-  const key = req.ip || 'unknown';
+  const key = req.ip || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
   const current = hits.get(key);
 
@@ -19,8 +28,9 @@ app.use('/api/', (req, res, next) => {
   }
 
   if (current.count >= 10) {
+    res.setHeader('Retry-After', '60');
     return res.status(429).json({
-      error: 'Too many requests. Wait one minute.'
+      error: 'Too many requests. Please wait a minute.'
     });
   }
 
@@ -53,11 +63,15 @@ app.post('/api/chat', async (req, res) => {
     const message = String(req.body?.message || '').trim();
 
     if (!message) {
-      return res.status(400).json({ error: 'Message is required.' });
+      return res.status(400).json({
+        error: 'Message is required.'
+      });
     }
 
     if (message.length > 8000) {
-      return res.status(413).json({ error: 'Message is too long.' });
+      return res.status(413).json({
+        error: 'Message is too long.'
+      });
     }
 
     const history = Array.isArray(req.body?.history)
@@ -79,7 +93,7 @@ app.post('/api/chat', async (req, res) => {
       }));
 
     const response = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent',
       {
         method: 'POST',
         headers: {
@@ -89,7 +103,7 @@ app.post('/api/chat', async (req, res) => {
         body: JSON.stringify({
           systemInstruction: {
             parts: [{
-              text: 'You are AgentAI, a helpful practical assistant. Give concise, clear answers. Never claim you performed an action unless you actually did.'
+              text: 'You are AgentAI, a practical personal assistant. Give concise, clear answers. Help users draft, plan and organize tasks. Never claim to have performed actions unless you actually did.'
             }]
           },
           contents,
@@ -101,15 +115,14 @@ app.post('/api/chat', async (req, res) => {
       }
     );
 
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
       console.error('Gemini API error:', data.error?.message);
 
       return res.status(502).json({
-        error: response.status === 429
-          ? 'Gemini quota reached. Try again later.'
-          : 'Gemini API error. Check your API key and Render logs.'
+        error: data.error?.message ||
+          'Gemini API error. Check the Render logs.'
       });
     }
 
@@ -125,12 +138,12 @@ app.post('/api/chat', async (req, res) => {
     }
 
     res.json({ reply });
-
   } catch (err) {
     console.error('AgentAI error:', err.message);
 
-    res.status(500).json({
-      error: 'Server error. Check Render logs.'
+    res.status(err.name === 'TimeoutError' ||
+      err.name === 'AbortError' ? 504 : 500).json({
+      error: 'Server error. Check the Render logs.'
     });
   }
 });
