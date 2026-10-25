@@ -7,11 +7,30 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '32kb' }));
 
+const PORT = Number(process.env.PORT || 3000);
+
+const MODELS = [
+  process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+  'gemini-2.0-flash'
+];
+
+function indiaTime() {
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    dateStyle: 'full',
+    timeStyle: 'long'
+  }).format(new Date());
+}
+
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, aiConfigured: Boolean(process.env.GEMINI_API_KEY) });
+  res.json({
+    ok: true,
+    aiConfigured: Boolean(process.env.GEMINI_API_KEY),
+    time: indiaTime()
+  });
 });
 
-app.use(express.static(path.join(__dirname), {
+app.use(express.static(__dirname, {
   dotfiles: 'deny',
   index: 'index.html'
 }));
@@ -19,98 +38,185 @@ app.use(express.static(path.join(__dirname), {
 app.post('/api/chat', async (req, res) => {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
+
     if (!apiKey) {
       return res.status(503).json({
-        error: 'Add GEMINI_API_KEY in Render Environment.'
+        error: 'GEMINI_API_KEY missing in Render Environment.'
       });
     }
 
     const message = String(req.body?.message || '').trim();
+
     if (!message) {
-      return res.status(400).json({ error: 'Message is required.' });
+      return res.status(400).json({
+        error: 'Please enter a message.'
+      });
     }
+
     if (message.length > 8000) {
-      return res.status(413).json({ error: 'Message is too long.' });
+      return res.status(413).json({
+        error: 'Message is too long.'
+      });
     }
 
     const history = Array.isArray(req.body?.history)
-      ? req.body.history.slice(-16)
+      ? req.body.history.slice(-12)
       : [];
 
-    const contents = [...history, { role: 'user', content: message }]
-      .filter(m =>
-        m &&
-        ['user', 'assistant'].includes(m.role) &&
-        typeof m.content === 'string'
+    const contents = history
+      .filter(item =>
+        item &&
+        ['user', 'assistant', 'model'].includes(item.role) &&
+        typeof item.content === 'string' &&
+        item.content.trim()
       )
-      .map(m => ({
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.content.slice(0, 8000) }]
+      .map(item => ({
+        role: ['assistant', 'model'].includes(item.role)
+          ? 'model'
+          : 'user',
+        parts: [{ text: item.content.slice(0, 4000) }]
       }));
 
-    const models = [
-      'gemini-3.8-flash',
-      'gemini-3.6-flash',
-      'gemini-3.5-flash-lite'
-    ];
+    contents.push({
+      role: 'user',
+      parts: [{
+        text: `Current date and time in India: ${indiaTime()}\n\nUser question: ${message}`
+      }]
+    });
 
-    let lastError = 'AI is temporarily busy. Please try again.';
-    for (const model of models) {
+    const systemInstruction = `
+You are AgentAI, a smart general-purpose AI assistant.
+
+Your job:
+- Answer the user's actual question directly.
+- Never replace a real answer with "Hello, how can I help you?"
+- Understand Hindi, English and Hinglish.
+- Help with education, coding, mathematics, science, writing,
+  general knowledge, planning and everyday questions.
+- Explain difficult topics step by step when helpful.
+- Use the supplied India date and time for questions about today,
+  tomorrow, the weekday and current time.
+- Use Google Search when enabled and current or changing information
+  needs verification.
+- Never claim to have searched the web unless the search tool was used.
+- Never invent facts, sources or completed actions.
+- If uncertain, explain the uncertainty honestly.
+- Be clear, useful, respectful and concise.
+`;
+
+    let lastError = 'AI is temporarily unavailable. Try again.';
+
+    for (const model of [...new Set(MODELS)]) {
       try {
         const response = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
           {
             method: 'POST',
             headers: {
-              'x-goog-api-key': apiKey,
-              'Content-Type': 'application/json'
+              'Content-Type': 'application/json',
+              'x-goog-api-key': apiKey
             },
             body: JSON.stringify({
               systemInstruction: {
-                parts: [{
-                  text: 'You are AgentAI, a practical personal assistant. Give concise, clear answers. Never claim to have performed actions unless you actually did.'
-                }]
+                parts: [{ text: systemInstruction }]
               },
               contents,
-              generationConfig: { maxOutputTokens: 700 }
+              tools: [{ google_search: {} }],
+              generationConfig: {
+                maxOutputTokens: 1200,
+                temperature: 0.7
+              }
             }),
-            signal: AbortSignal.timeout(15000)
+            signal: AbortSignal.timeout(30000)
           }
         );
 
         const data = await response.json().catch(() => ({}));
 
         if (!response.ok) {
-          lastError = data.error?.message || `Model ${model} failed`;
-          console.error(`Gemini ${model} error:`, lastError);
+          lastError = data.error?.message ||
+            `Gemini API returned ${response.status}`;
 
-          if ([400, 401, 403].includes(response.status)) {
-            return res.status(502).json({ error: lastError });
+          console.error(`${model}:`, lastError);
+
+          // A bad key or permission issue will not be fixed by
+          // trying another model.
+          if ([401, 403].includes(response.status)) {
+            return res.status(502).json({
+              error: 'Gemini API key or permission problem. Check Render.'
+            });
           }
+
           continue;
         }
 
-        const reply = (data.candidates?.[0]?.content?.parts || [])
+        const candidate = data.candidates?.[0];
+
+        const reply = (candidate?.content?.parts || [])
           .map(part => part.text || '')
+          .filter(Boolean)
           .join('\n')
           .trim();
 
-        if (reply) return res.json({ reply });
-        lastError = 'Gemini returned an empty response.';
-      } catch (err) {
-        lastError = err.message || 'Connection error';
-        console.error(`Gemini ${model} error:`, lastError);
+        if (!reply) {
+          lastError = 'The AI returned no text.';
+          continue;
+        }
+
+        const sources = [];
+
+        for (const part of candidate.content.parts || []) {
+          for (const meta of part.metadata || []) {
+            if (meta.url) {
+              sources.push({
+                title: meta.title || meta.url,
+                url: meta.url
+              });
+            }
+          }
+        }
+
+        // Google Search grounding metadata can contain web sources.
+        for (const chunk of
+          candidate.groundingMetadata?.groundingChunks || []) {
+          const web = chunk.web;
+
+          if (web?.uri) {
+            sources.push({
+              title: web.title || web.uri,
+              url: web.uri
+            });
+          }
+        }
+
+        const uniqueSources = [
+          ...new Map(sources.map(s => [s.url, s])).values()
+        ];
+
+        return res.json({
+          reply,
+          sources: uniqueSources
+        });
+
+      } catch (error) {
+        lastError = error.message || 'Connection error';
+        console.error(`${model}:`, lastError);
       }
     }
 
     return res.status(503).json({
-      error: 'All AI models are busy or unavailable. Please try again shortly.'
+      error: 'AI could not answer right now. Check Render logs and API quota.'
     });
-  } catch (err) {
-    console.error('AgentAI error:', err.message);
-    return res.status(500).json({ error: 'Server error. Check Render logs.' });
+
+  } catch (error) {
+    console.error('AgentAI error:', error);
+
+    return res.status(500).json({
+      error: 'Server error. Check Render logs.'
+    });
   }
 });
 
-const port = Number(process.env.PORT || 3000);
-app.listen(port, () => console.log(`AgentAI running on port ${port}`));
+app.listen(PORT, () => {
+  console.log(`AgentAI running on port ${PORT}`);
+});
